@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# Defaults (can be overridden by positional args)
+# 1: NAMESPACE (default: kube-system)
+# 2: SUBCOMMAND (default: top)
+# 3: RESOURCE_TYPE (default: pods)
+NAMESPACE="${1:-kube-system}"
+SUBCOMMAND="${2:-top}"
+RESOURCE_TYPE="${3:-pods}"
+
+# CSV header
+echo "Resource,Namespace,Name,CPU,Memory"
+
+if [[ "$RESOURCE_TYPE" == "nodes" ]]; then
+  # Try metrics first (nodes are cluster-scoped; no -n flag)
+  if kubectl "$SUBCOMMAND" nodes >/tmp/k8s_top_nodes.out 2>/tmp/k8s_top_nodes.err; then
+    tail -n +2 /tmp/k8s_top_nodes.out | while IFS= read -r line; do
+      NAME=$(awk '{print $1}' <<<"$line")
+      CPU=$(awk '{print $2}' <<<"$line")     # CPU(cores)
+      MEMORY=$(awk '{print $4}' <<<"$line")  # MEMORY(bytes)
+      printf "%s,%s,%s,%s,%s\n" "nodes" "" "$NAME" "$CPU" "$MEMORY"
+    done
+  else
+    # If Metrics API is unavailable, list nodes with N/A metrics
+    if grep -q "Metrics API not available" /tmp/k8s_top_nodes.err; then
+      kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while IFS= read -r NAME; do
+        printf "%s,%s,%s,%s,%s\n" "nodes" "" "$NAME" "N/A" "N/A"
+      done
+      >&2 echo "Warning: Metrics API not available; emitted N/A for CPU/Memory."
+    else
+      >&2 cat /tmp/k8s_top_nodes.err
+      exit 1
+    fi
+  fi
+else
+  # Pods and other namespaced resources
+  if kubectl "$SUBCOMMAND" "$RESOURCE_TYPE" -n "$NAMESPACE" >/tmp/k8s_top_ns.out 2>/tmp/k8s_top_ns.err; then
+    tail -n +2 /tmp/k8s_top_ns.out | while IFS= read -r line; do
+      NAME=$(awk '{print $1}' <<<"$line")
+      CPU=$(awk '{print $2}' <<<"$line")     # CPU(cores)
+      MEMORY=$(awk '{print $3}' <<<"$line")  # MEMORY(bytes)
+      printf "%s,%s,%s,%s,%s\n" "$RESOURCE_TYPE" "$NAMESPACE" "$NAME" "$CPU" "$MEMORY"
+    done
+  else
+    if grep -q "Metrics API not available" /tmp/k8s_top_ns.err; then
+      kubectl get "$RESOURCE_TYPE" -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while IFS= read -r NAME; do
+        printf "%s,%s,%s,%s,%s\n" "$RESOURCE_TYPE" "$NAMESPACE" "$NAME" "N/A" "N/A"
+      done
+      >&2 echo "Warning: Metrics API not available; emitted N/A for CPU/Memory."
+    else
+      >&2 cat /tmp/k8s_top_ns.err
+      exit 1
+    fi
+  fi
+fi
