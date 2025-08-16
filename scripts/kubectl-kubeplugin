@@ -1,55 +1,165 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Defaults (can be overridden by positional args)
-# 1: NAMESPACE (default: kube-system)
-# 2: SUBCOMMAND (default: top)
-# 3: RESOURCE_TYPE (default: pods)
-NAMESPACE="${1:-kube-system}"
-SUBCOMMAND="${2:-top}"
-RESOURCE_TYPE="${3:-pods}"
+show_help() {
+  cat <<'EOF'
+Usage:
+  kubectl kubeplugin [NAMESPACE] [RESOURCE_TYPE]
 
-# CSV header
+Positional arguments:
+  NAMESPACE       Kubernetes namespace (default: kube-system).
+  RESOURCE_TYPE   pods | nodes  (default: pods)
+
+Notes:
+  • For 'nodes' (cluster-scoped), the Namespace column is printed as '-'.
+  • This command uses `kubectl top`. If the Metrics API is unavailable,
+    CPU/Memory are emitted as N/A.
+
+Flags:
+  -A, --all-namespaces                 If true, display metrics for all accessible namespaces
+  -h, --help                           help
+
+Requirement (official docs):
+  • Metrics Server must be installed and healthy:
+    https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/
+    https://github.com/kubernetes-sigs/metrics-server
+  • kubectl plugin basics:
+    https://kubernetes.io/docs/tasks/extend-kubectl/kubectl-plugins/
+
+Examples:
+  kubectl kubeplugin                 # kube-system pods
+  kubectl kubeplugin default pods    # pods in 'default' namespace
+  kubectl kubeplugin nodes           # cluster nodes (Namespace column '-')
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  show_help
+  exit 0
+fi
+
+# Support -A/--all-namespaces (simple: only if provided first)
+ALL_NAMESPACES=0
+if [[ "${1:-}" == "-A" || "${1:-}" == "--all-namespaces" ]]; then
+  ALL_NAMESPACES=1
+  shift
+fi
+
+# Defaults
+NAMESPACE="kube-system"
+RESOURCE_TYPE="pods"
+
+# Parse positional args for plugin UX:
+# 0 args -> kube-system pods
+# 1 arg  -> "nodes" (cluster scope) OR it's a namespace
+# 2 args -> <namespace> <resource_type>
+case $# in
+  0) : ;;
+  1)
+     if [[ "$1" == "nodes" ]]; then
+       RESOURCE_TYPE="nodes"
+     else
+       NAMESPACE="$1"
+     fi
+     ;;
+  2)
+     NAMESPACE="$1"
+     RESOURCE_TYPE="$2"
+     ;;
+  *)
+     echo "Error: too many arguments." >&2
+     show_help
+     exit 2
+     ;;
+esac
+
+# Normalize resource type
+shopt -s nocasematch
+if [[ "$RESOURCE_TYPE" =~ ^node(s)?$ ]]; then
+  RESOURCE_TYPE="nodes"
+elif [[ "$RESOURCE_TYPE" =~ ^pod(s)?$ ]]; then
+  RESOURCE_TYPE="pods"
+else
+  echo "Error: RESOURCE_TYPE must be 'pods' or 'nodes'." >&2
+  show_help
+  exit 2
+fi
+shopt -u nocasematch
+
 echo "Resource,Namespace,Name,CPU,Memory"
 
+# Temp files + cleanup
+OUT_FILE="$(mktemp)"
+ERR_FILE="$(mktemp)"
+cleanup() { rm -f "$OUT_FILE" "$ERR_FILE"; }
+trap cleanup EXIT
+
 if [[ "$RESOURCE_TYPE" == "nodes" ]]; then
-  # Try metrics first (nodes are cluster-scoped; no -n flag)
-  if kubectl "$SUBCOMMAND" nodes >/tmp/k8s_top_nodes.out 2>/tmp/k8s_top_nodes.err; then
-    tail -n +2 /tmp/k8s_top_nodes.out | while IFS= read -r line; do
+  # Cluster-scoped; no namespace flag
+  if kubectl top nodes >"$OUT_FILE" 2>"$ERR_FILE"; then
+    # NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%
+    tail -n +2 "$OUT_FILE" | while IFS= read -r line; do
       NAME=$(awk '{print $1}' <<<"$line")
-      CPU=$(awk '{print $2}' <<<"$line")     # CPU(cores)
-      MEMORY=$(awk '{print $4}' <<<"$line")  # MEMORY(bytes)
-      printf "%s,%s,%s,%s,%s\n" "nodes" "" "$NAME" "$CPU" "$MEMORY"
+      CPU=$(awk '{print $2}' <<<"$line")
+      MEMORY=$(awk '{print $4}' <<<"$line")
+      printf "%s,%s,%s,%s,%s\n" "nodes" "-" "$NAME" "$CPU" "$MEMORY"
     done
   else
-    # If Metrics API is unavailable, list nodes with N/A metrics
-    if grep -q "Metrics API not available" /tmp/k8s_top_nodes.err; then
-      kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while IFS= read -r NAME; do
-        printf "%s,%s,%s,%s,%s\n" "nodes" "" "$NAME" "N/A" "N/A"
-      done
+    if grep -qi "metrics api not available" "$ERR_FILE"; then
+      kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+      | while IFS= read -r NAME; do
+          printf "%s,%s,%s,%s,%s\n" "nodes" "-" "$NAME" "N/A" "N/A"
+        done
       >&2 echo "Warning: Metrics API not available; emitted N/A for CPU/Memory."
     else
-      >&2 cat /tmp/k8s_top_nodes.err
+      >&2 cat "$ERR_FILE"
       exit 1
     fi
   fi
 else
-  # Pods and other namespaced resources
-  if kubectl "$SUBCOMMAND" "$RESOURCE_TYPE" -n "$NAMESPACE" >/tmp/k8s_top_ns.out 2>/tmp/k8s_top_ns.err; then
-    tail -n +2 /tmp/k8s_top_ns.out | while IFS= read -r line; do
-      NAME=$(awk '{print $1}' <<<"$line")
-      CPU=$(awk '{print $2}' <<<"$line")     # CPU(cores)
-      MEMORY=$(awk '{print $3}' <<<"$line")  # MEMORY(bytes)
-      printf "%s,%s,%s,%s,%s\n" "$RESOURCE_TYPE" "$NAMESPACE" "$NAME" "$CPU" "$MEMORY"
-    done
-  else
-    if grep -q "Metrics API not available" /tmp/k8s_top_ns.err; then
-      kubectl get "$RESOURCE_TYPE" -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while IFS= read -r NAME; do
-        printf "%s,%s,%s,%s,%s\n" "$RESOURCE_TYPE" "$NAMESPACE" "$NAME" "N/A" "N/A"
+  # Namespaced resources (pods)
+  if [[ "$ALL_NAMESPACES" -eq 1 ]]; then
+    if kubectl top pods -A >"$OUT_FILE" 2>"$ERR_FILE"; then
+      # NAMESPACE NAME CPU(cores) MEMORY(bytes)
+      tail -n +2 "$OUT_FILE" | while IFS= read -r line; do
+        NS=$(awk '{print $1}' <<<"$line")
+        NAME=$(awk '{print $2}' <<<"$line")
+        CPU=$(awk '{print $3}' <<<"$line")
+        MEMORY=$(awk '{print $4}' <<<"$line")
+        printf "%s,%s,%s,%s,%s\n" "pods" "$NS" "$NAME" "$CPU" "$MEMORY"
       done
-      >&2 echo "Warning: Metrics API not available; emitted N/A for CPU/Memory."
     else
-      >&2 cat /tmp/k8s_top_ns.err
-      exit 1
+      if grep -qi "metrics api not available" "$ERR_FILE"; then
+        kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' \
+        | while read -r NS NAME; do
+            printf "%s,%s,%s,%s,%s\n" "pods" "$NS" "$NAME" "N/A" "N/A"
+          done
+        >&2 echo "Warning: Metrics API not available; emitted N/A for CPU/Memory."
+      else
+        >&2 cat "$ERR_FILE"
+        exit 1
+      fi
+    fi
+  else
+    if kubectl top pods -n "$NAMESPACE" >"$OUT_FILE" 2>"$ERR_FILE"; then
+      # NAME CPU(cores) MEMORY(bytes)
+      tail -n +2 "$OUT_FILE" | while IFS= read -r line; do
+        NAME=$(awk '{print $1}' <<<"$line")
+        CPU=$(awk '{print $2}' <<<"$line")
+        MEMORY=$(awk '{print $3}' <<<"$line")
+        printf "%s,%s,%s,%s,%s\n" "pods" "$NAMESPACE" "$NAME" "$CPU" "$MEMORY"
+      done
+    else
+      if grep -qi "metrics api not available" "$ERR_FILE"; then
+        kubectl get pods -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+        | while IFS= read -r NAME; do
+            printf "%s,%s,%s,%s,%s\n" "pods" "$NAMESPACE" "$NAME" "N/A" "N/A"
+          done
+        >&2 echo "Warning: Metrics API not available; emitted N/A for CPU/Memory."
+      else
+        >&2 cat "$ERR_FILE"
+        exit 1
+      fi
     fi
   fi
 fi
